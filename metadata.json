@@ -1,0 +1,5 @@
+{
+  "name": "Federated Privacy Data Analyzer",
+  "description": "A privacy-preserving data analysis system using local LLMs and federated aggregation.",
+  "requestFramePermissions": []
+}

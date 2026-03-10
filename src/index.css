@@ -1,0 +1,38 @@
+@import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Space Grotesk", sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+}
+
+:root {
+  --client-bg: #fff5f5;
+  --client-primary: #e53e3e;
+  --client-secondary: #fff5f5;
+  --admin-bg: #0a0a0a;
+  --admin-neon: #00ff9d;
+}
+
+body {
+  @apply font-sans antialiased;
+}
+
+.neon-text {
+  text-shadow: 0 0 10px var(--admin-neon), 0 0 20px var(--admin-neon);
+}
+
+.neon-border {
+  box-shadow: 0 0 10px var(--admin-neon);
+  border-color: var(--admin-neon);
+}
+
+@keyframes spin-slow {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.animate-spin-slow {
+  animation: spin-slow 8s linear infinite;
+}
