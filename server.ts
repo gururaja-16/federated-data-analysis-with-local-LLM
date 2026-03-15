@@ -4,11 +4,32 @@ import Database from "better-sqlite3";
 import path from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
+import multer from "multer";
+import * as XLSX from "xlsx";
+import mammoth from "mammoth";
+import fs from "fs";
+import { createRequire } from "module";
+import os from "os";
+import bcrypt from "bcryptjs";
+import twilio from "twilio";
+import axios from "axios";
+import { Ollama } from "ollama";
+
+const require = createRequire(import.meta.url);
+const pdf = require("pdf-parse");
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Multer configuration for ESM
+const upload = multer({ dest: os.tmpdir() });
+
+// Twilio Client
+const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN 
+  ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
+  : null;
 
 let db: any;
 try {
@@ -28,11 +49,23 @@ try {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       username TEXT UNIQUE,
       password TEXT,
+      phone_number TEXT,
+      otp_code TEXT,
+      github_id TEXT UNIQUE,
       role TEXT DEFAULT 'client'
     );
-    -- ... other tables ...
   `);
-  // Re-run the full schema just in case
+  
+  // Migration: Add phone_number, otp_code, and github_id if they don't exist
+  const tableInfo = db.prepare("PRAGMA table_info(users)").all();
+  const hasPhone = tableInfo.some((col: any) => col.name === 'phone_number');
+  const hasOtp = tableInfo.some((col: any) => col.name === 'otp_code');
+  const hasGithub = tableInfo.some((col: any) => col.name === 'github_id');
+  
+  if (!hasPhone) db.exec("ALTER TABLE users ADD COLUMN phone_number TEXT");
+  if (!hasOtp) db.exec("ALTER TABLE users ADD COLUMN otp_code TEXT");
+  if (!hasGithub) db.exec("ALTER TABLE users ADD COLUMN github_id TEXT");
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS raw_data (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,18 +93,21 @@ try {
 // Seed Admin if not exists
 const adminExists = db.prepare("SELECT * FROM users WHERE username = ?").get("admin");
 if (!adminExists) {
-  db.prepare("INSERT INTO users (username, password, role) VALUES (?, ?, ?)").run("admin", "admin123", "admin");
+  const hashedPassword = bcrypt.hashSync("admin123", 10);
+  db.prepare("INSERT INTO users (username, password, role) VALUES (?, ?, ?)").run("admin", hashedPassword, "admin");
 }
 
 // Seed a Test Client if not exists
 const clientExists = db.prepare("SELECT * FROM users WHERE username = ?").get("client1");
 if (!clientExists) {
-  db.prepare("INSERT INTO users (username, password, role) VALUES (?, ?, ?)").run("client1", "client123", "client");
+  const hashedPassword = bcrypt.hashSync("client123", 10);
+  db.prepare("INSERT INTO users (username, password, role) VALUES (?, ?, ?)").run("client1", hashedPassword, "client");
 }
 
 async function startServer() {
   const app = express();
   app.use(express.json());
+  app.use(express.urlencoded({ extended: true }));
   // Logger Middleware
   app.use((req, res, next) => {
     console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
@@ -81,116 +117,260 @@ async function startServer() {
   // Auth API
   app.post("/api/login", (req, res) => {
     const { username, password } = req.body;
-    const user = db.prepare("SELECT * FROM users WHERE username = ? AND password = ?").get(username, password) as any;
-    if (user) {
-      res.json({ id: user.id, username: user.username, role: user.role });
+    const user = db.prepare("SELECT * FROM users WHERE username = ?").get(username) as any;
+    if (user && bcrypt.compareSync(password, user.password)) {
+      res.json({ id: user.id, username: user.username, role: user.role, phone_number: user.phone_number });
     } else {
       res.status(401).json({ error: "Invalid credentials" });
     }
   });
 
-  // Health Check
-  app.get("/api/health", (req, res) => {
-    res.json({ status: "ok", timestamp: new Date().toISOString() });
+  app.post("/api/register", (req, res) => {
+    const { username, password, phone_number } = req.body;
+    if (!username || !password) return res.status(400).json({ error: "Username and password required" });
+    
+    try {
+      const hashedPassword = bcrypt.hashSync(password, 10);
+      db.prepare("INSERT INTO users (username, password, phone_number, role) VALUES (?, ?, ?, ?)").run(username, hashedPassword, phone_number || null, "client");
+      res.json({ success: true });
+    } catch (error) {
+      res.status(400).json({ error: "Username already exists" });
+    }
   });
 
-  // Helper: Call Local Ollama LLM
-  async function callLocalLLM(prompt: string, format?: string) {
-    try {
-      if (typeof fetch === "undefined") {
-        throw new Error("Native fetch not available");
+  app.post("/api/forgot-password", async (req, res) => {
+    const { phone_number } = req.body;
+    if (!phone_number) return res.status(400).json({ error: "Phone number required" });
+
+    const user = db.prepare("SELECT * FROM users WHERE phone_number = ?").get(phone_number) as any;
+    if (!user) return res.status(404).json({ error: "User not found with this phone number" });
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    db.prepare("UPDATE users SET otp_code = ? WHERE id = ?").run(otp, user.id);
+
+    if (twilioClient && process.env.TWILIO_PHONE_NUMBER) {
+      try {
+        await twilioClient.messages.create({
+          body: `Your Privacy Portal password reset code is: ${otp}`,
+          from: process.env.TWILIO_PHONE_NUMBER,
+          to: phone_number
+        });
+        res.json({ success: true, message: "OTP sent via SMS" });
+      } catch (error: any) {
+        console.error("Twilio error:", error);
+        res.status(500).json({ error: "Failed to send SMS", details: error.message });
       }
+    } else {
+      console.log(`[DEV MODE] OTP for ${phone_number}: ${otp}`);
+      res.json({ success: true, message: "OTP generated (check server logs in dev mode)", devOtp: otp });
+    }
+  });
 
-      const body: any = {
-        model: "mistral",
-        prompt: prompt,
-        stream: false,
-      };
-      if (format) body.format = format;
+  app.post("/api/reset-password", (req, res) => {
+    const { phone_number, otp, newPassword } = req.body;
+    if (!phone_number || !otp || !newPassword) return res.status(400).json({ error: "Missing fields" });
 
-      const response = await fetch("http://localhost:11434/api/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+    const user = db.prepare("SELECT * FROM users WHERE phone_number = ? AND otp_code = ?").get(phone_number, otp) as any;
+    if (!user) return res.status(400).json({ error: "Invalid OTP or phone number" });
+
+    const hashedPassword = bcrypt.hashSync(newPassword, 10);
+    db.prepare("UPDATE users SET password = ?, otp_code = NULL WHERE id = ?").run(hashedPassword, user.id);
+    res.json({ success: true });
+  });
+
+  // GitHub OAuth API
+  app.get("/api/auth/github/url", (req, res) => {
+    const clientId = process.env.GITHUB_CLIENT_ID;
+    if (!clientId) return res.status(500).json({ error: "GitHub Client ID not configured" });
+
+    const redirectUri = `${process.env.APP_URL || `http://localhost:3000`}/api/auth/github/callback`;
+    const url = `https://github.com/login/oauth/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=user:email`;
+    res.json({ url });
+  });
+
+  app.get("/api/auth/github/callback", async (req, res) => {
+    const { code } = req.query;
+    if (!code) return res.status(400).send("Code missing");
+
+    try {
+      // Exchange code for token
+      const tokenRes = await axios.post("https://github.com/login/oauth/access_token", {
+        client_id: process.env.GITHUB_CLIENT_ID,
+        client_secret: process.env.GITHUB_CLIENT_SECRET,
+        code,
+      }, {
+        headers: { Accept: "application/json" }
       });
 
-      if (response.ok) {
-        const data = await response.json();
-        return data.response;
+      const accessToken = tokenRes.data.access_token;
+      if (!accessToken) throw new Error("Failed to get access token");
+
+      // Get user info
+      const userRes = await axios.get("https://api.github.com/user", {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+
+      const githubUser = userRes.data;
+      const githubId = githubUser.id.toString();
+      const username = githubUser.login;
+
+      // Check if user exists
+      let user = db.prepare("SELECT * FROM users WHERE github_id = ?").get(githubId) as any;
+      
+      if (!user) {
+        // Create new user if doesn't exist
+        // Handle username collision
+        let finalUsername = username;
+        const existing = db.prepare("SELECT id FROM users WHERE username = ?").get(finalUsername);
+        if (existing) {
+          finalUsername = `${username}_gh_${githubId.substring(0, 4)}`;
+        }
+
+        db.prepare("INSERT INTO users (username, github_id, role) VALUES (?, ?, ?)").run(finalUsername, githubId, "client");
+        user = db.prepare("SELECT * FROM users WHERE github_id = ?").get(githubId);
       }
-    } catch (e) {
-      console.log("Ollama not reachable.");
-    }
-    return null;
-  }
 
-  async function analyzeWithLocalLLM(content: string) {
-    const prompt = `Analyze the following sensitive data and extract metrics for a federated privacy system. 
-    Return ONLY a JSON object with these keys: risk_score (0-100), confidence (0-1), summary (short string), features (comma separated list).
-    Data: ${content}`;
-    
-    const response = await callLocalLLM(prompt, "json");
-    if (response) {
-      try {
-        return JSON.parse(response);
-      } catch (e) {
-        console.error("Failed to parse LLM response as JSON");
-      }
-    }
-
-    // Fallback Simulation
-    return {
-      risk_score: Math.random() * 100,
-      confidence: 0.7 + Math.random() * 0.3,
-      features: ["BP", "Age", "History"].filter(() => Math.random() > 0.5).join(", "),
-      summary: "Simulated analysis: Patient shows stable metrics with minor variations in historical data."
-    };
-  }
-
-  // Chat API: Kani Chatbot
-  app.post("/api/chat", async (req, res) => {
-    const { message, history } = req.body;
-    const systemPrompt = `You are Kani, a 24/7 privacy-focused AI assistant. 
-    Your goal is to help users protect their sensitive data, explain privacy metrics, and guide them through the federated analysis process.
-    Be professional, helpful, and act as an Agentic AI that can provide actionable advice on data anonymization and security.
-    Keep responses concise but informative.`;
-
-    const fullPrompt = `${systemPrompt}\n\nChat History:\n${history.map((h: any) => `${h.role}: ${h.content}`).join("\n")}\nUser: ${message}\nKani:`;
-    
-    const response = await callLocalLLM(fullPrompt);
-    if (response) {
-      res.json({ response });
-    } else {
-      res.json({ response: "I'm currently in offline mode (Ollama not detected). I can help you with general privacy advice: Always anonymize PII (Personally Identifiable Information) before sharing data!" });
+      // Send success message to parent window and close popup
+      res.send(`
+        <html>
+          <body>
+            <script>
+              if (window.opener) {
+                window.opener.postMessage({ 
+                  type: 'OAUTH_AUTH_SUCCESS', 
+                  user: ${JSON.stringify({ id: user.id, username: user.username, role: user.role })} 
+                }, '*');
+                window.close();
+              } else {
+                window.location.href = '/';
+              }
+            </script>
+            <p>Authentication successful. This window should close automatically.</p>
+          </body>
+        </html>
+      `);
+    } catch (error: any) {
+      console.error("GitHub OAuth error:", error.response?.data || error.message);
+      res.status(500).send("Authentication failed");
     }
   });
 
-  // Client API: Upload & Analyze
-  app.post("/api/upload", async (req, res) => {
-    const { clientId, content } = req.body;
+  // Health Check
+  app.get("/api/health", async (req, res) => {
     try {
+      db.prepare("SELECT 1").get();
+      res.json({ 
+        status: "ok", 
+        db: "connected", 
+        timestamp: new Date().toISOString() 
+      });
+    } catch (err: any) {
+      res.status(500).json({ status: "error", db: "disconnected", error: err.message });
+    }
+  });
+
+  // Ollama API: Proxy for local LLM
+  app.post("/api/ollama/chat", async (req, res) => {
+    const { host, model, messages } = req.body;
+    try {
+      const ollama = new Ollama({ host: host || "http://localhost:11434" });
+      const response = await ollama.chat({
+        model: model || "mistral",
+        messages: messages,
+        stream: false,
+      });
+      res.json(response);
+    } catch (error: any) {
+      console.error("Ollama error:", error);
+      res.status(500).json({ error: "Failed to connect to local Ollama instance", details: error.message });
+    }
+  });
+
+  app.post("/api/ollama/generate", async (req, res) => {
+    const { host, model, prompt, system } = req.body;
+    try {
+      const ollama = new Ollama({ host: host || "http://localhost:11434" });
+      const response = await ollama.generate({
+        model: model || "mistral",
+        prompt: prompt,
+        system: system,
+        stream: false,
+        format: 'json'
+      });
+      res.json(response);
+    } catch (error: any) {
+      console.error("Ollama error:", error);
+      res.status(500).json({ error: "Failed to connect to local Ollama instance", details: error.message });
+    }
+  });
+
+  // Ollama functions removed
+
+  // Chat API: Kani Chatbot (Now handled on frontend)
+  app.post("/api/chat", async (req, res) => {
+    res.status(410).json({ error: "Chat endpoint moved to frontend" });
+  });
+
+  // Client API: Upload and Extract Text
+  app.post("/api/upload", upload.single("file"), async (req: any, res) => {
+    console.log("POST /api/upload received");
+    const { clientId } = req.body;
+    const file = req.file;
+    let content = req.body.content || "";
+
+    try {
+      if (file) {
+        console.log(`Processing file: ${file.originalname} (${file.size} bytes)`);
+        const filePath = file.path;
+        const extension = path.extname(file.originalname).toLowerCase();
+
+        if (extension === ".pdf") {
+          const dataBuffer = fs.readFileSync(filePath);
+          const data = await pdf(dataBuffer);
+          content = data.text;
+        } else if (extension === ".xlsx" || extension === ".xls" || extension === ".csv") {
+          const workbook = XLSX.readFile(filePath);
+          const sheetName = workbook.SheetNames[0];
+          const worksheet = workbook.Sheets[sheetName];
+          content = XLSX.utils.sheet_to_csv(worksheet);
+        } else if (extension === ".docx") {
+          const result = await mammoth.extractRawText({ path: filePath });
+          content = result.value;
+        } else if (extension === ".txt" || extension === ".json") {
+          content = fs.readFileSync(filePath, "utf-8");
+        }
+
+        // Clean up uploaded file
+        fs.unlinkSync(filePath);
+      }
+
+      if (!content || content.trim() === "") {
+        return res.status(400).json({ error: "No content found in file" });
+      }
+
       // 1. Save Raw Data locally (Privacy: This stays in the local node's DB)
-      const result = db.prepare("INSERT INTO raw_data (client_id, content) VALUES (?, ?)").run(clientId, content);
+      db.prepare("INSERT INTO raw_data (client_id, content) VALUES (?, ?)").run(clientId, content);
       
-      // 2. Perform Local Analysis (Mistral 7B)
-      const analysis = await analyzeWithLocalLLM(content);
-
-      // 3. Save Insights (This is what gets "shared" or aggregated)
-      db.prepare("INSERT INTO insights (client_id, risk_score, confidence, summary, features) VALUES (?, ?, ?, ?, ?)")
-        .run(clientId, analysis.risk_score, analysis.confidence, analysis.summary, analysis.features);
-
+      // Return content for frontend analysis
       res.json({ 
         success: true, 
-        insight: { 
-          riskScore: analysis.risk_score, 
-          confidence: analysis.confidence, 
-          summary: analysis.summary, 
-          features: analysis.features 
-        } 
+        content: content.substring(0, 10000) // Limit content size for response
       });
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Failed to process data" });
+    }
+  });
+
+  // Client API: Save Insight (Analysis result from frontend)
+  app.post("/api/save-insight", (req, res) => {
+    const { clientId, riskScore, confidence, summary, features } = req.body;
+    try {
+      db.prepare("INSERT INTO insights (client_id, risk_score, confidence, summary, features) VALUES (?, ?, ?, ?, ?)")
+        .run(clientId, riskScore, confidence, summary, features);
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to save insight" });
     }
   });
 
@@ -253,7 +433,7 @@ async function startServer() {
   // Admin API: CRUD Users
   app.get("/api/admin/users", (req, res) => {
     try {
-      const users = db.prepare("SELECT id, username, role FROM users").all();
+      const users = db.prepare("SELECT id, username, role, phone_number FROM users").all();
       res.json(users);
     } catch (error) {
       console.error("Error fetching admin users:", error);
@@ -262,18 +442,42 @@ async function startServer() {
   });
 
   app.post("/api/admin/users", (req, res) => {
-    const { username, password, role } = req.body;
+    const { username, password, role, phone_number } = req.body;
     try {
-      db.prepare("INSERT INTO users (username, password, role) VALUES (?, ?, ?)").run(username, password, role);
+      const hashedPassword = bcrypt.hashSync(password, 10);
+      db.prepare("INSERT INTO users (username, password, role, phone_number) VALUES (?, ?, ?, ?)").run(username, hashedPassword, role, phone_number || null);
       res.json({ success: true });
     } catch (error) {
       res.status(400).json({ error: "Username already exists" });
     }
   });
 
+  app.put("/api/admin/users/:id", (req, res) => {
+    const { username, password, role, phone_number } = req.body;
+    const { id } = req.params;
+    try {
+      if (password) {
+        const hashedPassword = bcrypt.hashSync(password, 10);
+        db.prepare("UPDATE users SET username = ?, password = ?, role = ?, phone_number = ? WHERE id = ?").run(username, hashedPassword, role, phone_number || null, id);
+      } else {
+        db.prepare("UPDATE users SET username = ?, role = ?, phone_number = ? WHERE id = ?").run(username, role, phone_number || null, id);
+      }
+      res.json({ success: true });
+    } catch (error) {
+      res.status(400).json({ error: "Error updating user" });
+    }
+  });
+
   app.delete("/api/admin/users/:id", (req, res) => {
     db.prepare("DELETE FROM users WHERE id = ?").run(req.params.id);
     res.json({ success: true });
+  });
+
+  // Catch-all for API routes to prevent falling through to Vite SPA fallback
+  app.all("/api/*", (req, res) => {
+    const msg = `API Route not found: ${req.method} ${req.url}`;
+    console.warn(msg);
+    res.status(404).json({ error: msg });
   });
 
   // Vite middleware for development
